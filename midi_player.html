@@ -1,0 +1,316 @@
+<!-- foi o chat que fez porque sim -->
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>seq playback</title>
+<style>
+    .aaaa {
+        display: flex;
+        flex-direction: row;
+        align-items: center;
+    }
+</style>
+</head>
+<body>
+<p>playback de arquivos .seq</p>
+<input type="file" id="file" accept=".seq,.json">
+<button id="play">Play</button>
+<button id="panic">Panic</button>
+<input type="checkbox" id="checkbox"><label for="checkbox">Loop</label>
+
+<div id="tracks" style="display:flex;flex-direction:column;margin-top:10px;padding:10px;">
+    <div class="aaaa" style="display:none" id="template">
+        <div style="width: 75px;"><span class="trackname">track0</span></div>
+        <canvas style="border: 1px solid black" class="osc" width="300" height="50"></canvas>
+        <input class="vol" type="range" min="0" max="100" value="100" step="1">
+        <select class="wvf">
+            <option value="sine">sine</option>
+            <option value="square">square</option>
+            <option value="triangle">triangle</option>
+            <option value="sawtooth">sawtooth</option>
+        </select>
+    </div>
+</div>
+
+<script>
+// ======================================================================
+// GLOBALS
+// ======================================================================
+let data = null;
+let context = null;
+let synths = {};
+let timeline = null;
+let loop = false;
+let schedulerTimer = null;
+let rafList = [];
+
+// ======================================================================
+// BUILD TIMELINE
+// ======================================================================
+function buildGlobalTimeline(json) {
+  const map = new Map();
+
+  for (const trackName of Object.keys(json)) {
+    const [onEvents, offEvents] = json[trackName];
+
+    for (const [ts, notes] of onEvents) {
+      if (!map.has(ts)) map.set(ts, []);
+      for (const n of notes)
+        map.get(ts).push({ note:n, type:"on", track:trackName });
+    }
+
+    for (const [ts, notes] of offEvents) {
+      if (!map.has(ts)) map.set(ts, []);
+      for (const n of notes)
+        map.get(ts).push({ note:n, type:"off", track:trackName });
+    }
+  }
+
+  return [...map.entries()]
+    .sort((a,b)=>a[0]-b[0])
+    .map(([time, events]) => ({ time, events }));
+}
+
+// ======================================================================
+// CLEANUP FUNCTIONS
+// ======================================================================
+function cleanupTracks() {
+  const tracksDiv = document.querySelector("#tracks");
+  [...tracksDiv.children].forEach(n => {
+    if (n.id !== "template") n.remove();
+  });
+}
+
+function cleanupAudioButKeepUI() {
+  if (schedulerTimer) {
+    clearInterval(schedulerTimer);
+    schedulerTimer = null;
+  }
+
+  for (const raf of rafList) cancelAnimationFrame(raf);
+  rafList = [];
+
+  if (synths) {
+    for (const s of Object.values(synths)) {
+      try { s.panic(); } catch {}
+    }
+  }
+
+  if (context) {
+    try { context.close(); } catch {}
+  }
+
+  context = null;
+  timeline = null;
+}
+
+function cleanupAudio() {
+  cleanupAudioButKeepUI();
+  cleanupTracks();
+  synths = {};
+}
+
+// ======================================================================
+// SIMPLE SYNTH
+// ======================================================================
+class SimpleSynth {
+  constructor(context, trackName) {
+    this.context = context;
+    this.active = new Map();
+    this.nextID = 1;
+    this.vol = 100;
+    this.waveform = "sine";
+
+    // UI
+    const template = document.querySelector("#template");
+    const clone = template.cloneNode(true);
+    clone.id = "";
+    clone.style.display = "flex";
+    clone.querySelector(".trackname").innerText = trackName;
+
+    const vol = clone.querySelector(".vol");
+    vol.addEventListener("input", () => this.vol = vol.value);
+
+    const waveform = clone.querySelector(".wvf");
+    waveform.addEventListener("change", () => this.waveform = waveform.value);
+
+    document.querySelector("#tracks").appendChild(clone);
+
+    // Oscilloscope
+    this.canvas = clone.querySelector(".osc");
+    this.ctx = this.canvas.getContext("2d");
+    this.analyser = context.createAnalyser();
+    this.analyser.fftSize = 2048;
+
+    this.dataArray = new Uint8Array(this.analyser.frequencyBinCount);
+    this.drawScope();
+  }
+
+  reconnectTo(newContext) {
+    this.context = newContext;
+    this.analyser = newContext.createAnalyser();
+    this.analyser.fftSize = 2048;
+    this.dataArray = new Uint8Array(this.analyser.frequencyBinCount);
+    this.drawScope();
+  }
+
+  drawScope() {
+    const draw = () => {
+      this.analyser.getByteTimeDomainData(this.dataArray);
+      const ctx = this.ctx;
+      const bufferLength = this.dataArray.length;
+
+      ctx.fillStyle = "#ccc";
+      ctx.fillRect(0,0,300,50);
+
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = "#000";
+      ctx.beginPath();
+
+      const slice = 300 / bufferLength;
+      let x = 0;
+
+      for (let i=0;i<bufferLength;i++) {
+        const v = this.dataArray[i]/128.0;
+        const y = v*(50/2);
+        if (i===0) ctx.moveTo(x,y);
+        else ctx.lineTo(x,y);
+        x += slice;
+      }
+      ctx.stroke();
+
+      const id = requestAnimationFrame(draw);
+      rafList.push(id);
+    };
+    draw();
+  }
+
+  noteOn(note, when) {
+    const id = this.nextID++;
+    const freq = 440 * Math.pow(2, (note - 69) / 12);
+
+    const osc = this.context.createOscillator();
+    const gain = this.context.createGain();
+
+    osc.type = this.waveform;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.2*(this.vol/100), when);
+
+    osc.connect(gain);
+    gain.connect(this.context.destination);
+    gain.connect(this.analyser);
+
+    osc.start(when);
+    this.active.set(id, { note, osc, gain });
+    return id;
+  }
+
+  noteOff(note, when) {
+    for (const [id, v] of this.active) {
+      if (v.note === note) {
+        v.gain.gain.linearRampToValueAtTime(0.0001, when+0.05);
+        v.osc.stop(when+0.05);
+        this.active.delete(id);
+      }
+    }
+  }
+
+  panic() {
+    for (const v of this.active.values()) {
+      try { v.osc.stop(); } catch {}
+    }
+    this.active.clear();
+  }
+}
+
+// ======================================================================
+// PLAYBACK
+// ======================================================================
+async function startPlayback(json, rebuildUI) {
+  if (rebuildUI) {
+    cleanupAudio();
+    context = new AudioContext();
+    synths = {};
+    for (const track of Object.keys(json))
+      synths[track] = new SimpleSynth(context, track);
+  } else {
+    cleanupAudioButKeepUI();
+    context = new AudioContext();
+    for (const track of Object.keys(synths))
+      synths[track].reconnectTo(context);
+  }
+
+  timeline = buildGlobalTimeline(json);
+
+  const start = context.currentTime;
+  let idx = 0;
+
+  return new Promise(resolve => {
+    schedulerTimer = setInterval(() => {
+      const now = context.currentTime - start;
+
+      while (idx < timeline.length &&
+             timeline[idx].time <= now + 0.1) {
+
+        const entry = timeline[idx];
+        const when = start + entry.time;
+
+        for (const ev of entry.events) {
+          const s = synths[ev.track];
+          if (ev.type === "on") s.noteOn(ev.note, when);
+          else s.noteOff(ev.note, when);
+        }
+
+        idx++;
+      }
+
+      if (idx >= timeline.length) {
+        clearInterval(schedulerTimer);
+        schedulerTimer = null;
+        resolve();
+      }
+    }, 20);
+  });
+}
+
+// ======================================================================
+// FILE LOADING
+// ======================================================================
+document.getElementById("file").addEventListener("change", e => {
+  cleanupAudio();
+  const file = e.target.files[0];
+  if (!file) return;
+
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      data = JSON.parse(reader.result);
+      console.log("Loaded JSON");
+    } catch {
+      console.error("Invalid JSON");
+    }
+  };
+  reader.readAsText(file);
+});
+
+// ======================================================================
+// BUTTONS
+// ======================================================================
+document.getElementById("checkbox").addEventListener("click", e => {
+  loop = e.target.checked;
+});
+
+document.getElementById("play").addEventListener("click", async () => {
+  if (!data) return;
+  await startPlayback(data, true);
+
+  while(loop) await startPlayback(data,false);
+});
+
+document.getElementById("panic").addEventListener("click", () => {
+  cleanupAudio();
+});
+</script>
+</body>
+</html>
