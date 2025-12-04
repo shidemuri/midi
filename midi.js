@@ -3,7 +3,7 @@ const NOTES_DOWN = 0
 
 const {Midi} = require('@tonejs/midi')
 const fs = require('fs')
-const owo = new Midi(fs.readFileSync('Touhou 6/th06_11.mid'))
+const owo = new Midi(fs.readFileSync(process.argv.length > 2 ? process.argv[2] : 'input.mid'))
 const base = {}
 
 //owo.tracks = [owo.tracks[20],owo.tracks[22], owo.tracks[28]]
@@ -36,4 +36,5 @@ for(const ti in owo.tracks) {
     base['track'+ti] = [trackconv,trackconv2]
 }
 fs.writeFileSync('input.seq',JSON.stringify(base))
+
 console.log('done')
